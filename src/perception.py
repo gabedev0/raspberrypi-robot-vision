@@ -1,90 +1,120 @@
+# src/perception.py
 import time
 import threading
 from collections import deque
+import logging
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-class CameraThread:
-    def __init__(self, src=0, width=640, height=360, queue_size=2):
-        self.cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
-        if not self.cap.isOpened():
-            raise RuntimeError("Não foi possível abrir a câmera (verifique libcamera / raspicam).")
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.q = deque(maxlen=queue_size)
-        self.stopped = False
-        self.t = threading.Thread(target=self._reader, daemon=True)
-        self.t.start()
+PICAMERA2_AVAILABLE = False
+try:
+    from picamera2 import Picamera2
+    PICAMERA2_AVAILABLE = True
+except Exception as e:
+    PICAMERA2_AVAILABLE = False
 
-    def _reader(self):
-        while not self.stopped:
-            ret, frame = self.cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
-            self.q.append(frame)
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("perception")
 
-    def read(self):
-        if self.q:
-            return self.q.pop()
+class CameraThread(threading.Thread):
+    def __init__(self, src=0, width=640, height=360, queue_size=2, use_picamera=True):
+        super().__init__(daemon=True)
+        self.width = width
+        self.height = height
+        self.queue = deque(maxlen=queue_size)
+        self.running = False
+        self.use_picamera = use_picamera and PICAMERA2_AVAILABLE
+        self.src = src
+
+        if self.use_picamera:
+            log.info("Usando Picamera2 para captura.")
+            self.picam2 = Picamera2()
+            config = self.picam2.create_preview_configuration({'size': (self.width, self.height)})
+            config['main']['format'] = 'RGB888'
+            self.picam2.configure(config)
         else:
-            ret, frame = self.cap.read()
-            if not ret:
-                return None
-            return frame
+            log.info("Usando OpenCV VideoCapture para captura (fallback).")
+            self.cap = cv2.VideoCapture(self.src, cv2.CAP_V4L2)
+            if not self.cap.isOpened():
+                raise RuntimeError("Não foi possível abrir VideoCapture (V4L2). Verifique libcamera/legacy driver.")
 
-    def release(self):
-        self.stopped = True
-        self.t.join(timeout=0.5)
-        self.cap.release()
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+
+    def run(self):
+        self.running = True
+        if self.use_picamera:
+            self.picam2.start()
+            while self.running:
+                try:
+                    arr = self.picam2.capture_array()
+                    if arr is None:
+                        log.warning("Picamera2 retornou None frame")
+                        time.sleep(0.01)
+                        continue
+                    frame = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                    self.queue.append(frame)
+                except Exception as e:
+                    log.exception("Erro lendo Picamera2: %s", e)
+                    time.sleep(0.1)
+        else:
+            while self.running:
+                ret, frame = self.cap.read()
+                if not ret or frame is None:
+                    log.debug("VideoCapture read falhou; tentando novamente")
+                    time.sleep(0.02)
+                    continue
+                self.queue.append(frame)
+
+    def read(self, timeout=1.0):
+        start = time.time()
+        while time.time() - start < timeout:
+            if len(self.queue) > 0:
+                return self.queue[-1].copy()
+            time.sleep(0.005)
+        return None
+
+    def stop(self):
+        self.running = False
+        if self.use_picamera:
+            try:
+                self.picam2.stop()
+            except Exception:
+                pass
+        else:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
 
 class ObjectDetector:
-    def __init__(self, model_name="yolov8n.pt", img_size=320, conf=0.25, iou=0.45, max_det=10):
-        self.model = YOLO(model_name)
-        self.img_size = img_size
+    def __init__(self, model_path="yolov8n.pt", device="cpu", conf=0.25, iou=0.45):
+        self.model = YOLO(model_path)
+        self.device = device
         self.conf = conf
         self.iou = iou
-        self.max_det = max_det
-        self.names_map = self.model.names if hasattr(self.model, "names") else {}
 
-    def detect(self, frame, wanted_idxs, scale=None):
-        h, w = frame.shape[:2]
-        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        results = self.model.predict(
-            source=img_rgb,
-            conf=self.conf,
-            iou=self.iou,
-            imgsz=self.img_size,
-            max_det=self.max_det,
-            device="cpu",
-            verbose=False
-        )
+    def infer(self, frame, imgsz=640):
+        results = self.model(frame, imgsz=imgsz, conf=self.conf, iou=self.iou, device=self.device)
         r = results[0]
-        boxes, scores, classes = [], [], []
-        if r.boxes is not None and len(r.boxes) > 0:
-            for b in r.boxes:
-                cls = int(b.cls.cpu().numpy().ravel())
-                if cls not in wanted_idxs:
-                    continue
-                xyxy = b.xyxy.cpu().numpy().ravel()
-                conf = float(b.conf.cpu().numpy().ravel())
-                if scale and scale < 1.0:
-                    xyxy = xyxy / scale
-                boxes.append(xyxy)
-                scores.append(conf)
-                classes.append(cls)
-        return boxes, scores, classes
+        try:
+            annotated = r.plot()
+        except Exception:
+            annotated = frame.copy()
+        classes = []
+        if hasattr(r, "boxes") and r.boxes is not None and len(r.boxes) > 0:
+            try:
+                cls = r.boxes.cls
+                classes = [int(x) for x in cls.tolist()]
+            except Exception:
+                for box in r.boxes:
+                    try:
+                        classes.append(int(box.cls))
+                    except Exception:
+                        pass
+        return annotated, classes
 
-def draw_boxes(frame, boxes, scores, classes, names):
-    for (x1, y1, x2, y2), conf, cls in zip(boxes, scores, classes):
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        label = f"{names[int(cls)]} {conf:.2f}"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        t = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-        cv2.rectangle(frame, (x1, y1 - 18), (x1 + t[0] + 6, y1), (0, 255, 0), -1)
-        cv2.putText(frame, label, (x1 + 3, y1 - 3),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-    return frame
+def draw_boxes(img, results):
+    return results

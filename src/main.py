@@ -1,105 +1,93 @@
+import socket
 import time
 import argparse
 import cv2
-import RPi.GPIO as GPIO
+import logging
 
-from perception import CameraThread, ObjectDetector, draw_boxes
-from motion_control import gpio_setup, stop_motors, forward, turn_left, turn_right
+from perception import CameraThread, ObjectDetector
 
-# Configs
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("main")
+
 CAM_INDEX = 0
 CAP_WIDTH, CAP_HEIGHT = 640, 360
 IMG_SZ = 320
 MODEL_NAME = "yolov8n.pt"
 CONF_THRESH, IOU_THRESH = 0.25, 0.45
-MAX_DETS = 10
-DEFAULT_SPEED = 70
 
-WANTED_CLASSES = ["person", "clock", "tvmonitor", "chair",
-                "traffic light", "cell phone", "mouse", "keyboard"]
-ALIAS = {"tv": "tvmonitor", "cellphone": "cell phone"}
+def map_classes_to_command(detected_classes):
+    """
+    Mapeamento de exemplo — ajuste para os classes IDs do teu modelo/dataset.
+    """
+    if not detected_classes:
+        return "STOP"
+    if 0 in detected_classes:
+        return "FORWARD"
+    if 2 in detected_classes:
+        return "LEFT"
+    return "STOP"
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--no-show", action="store_true")
-    parser.add_argument("--conf", type=float, default=CONF_THRESH)
-    args = parser.parse_args()
-    show = not args.no_show
+def run_client(server_ip, server_port=8000, use_picamera=True):
+    cam = CameraThread(src=CAM_INDEX, width=CAP_WIDTH, height=CAP_HEIGHT, use_picamera=use_picamera)
+    cam.start()
+    detector = ObjectDetector(model_path=MODEL_NAME, conf=CONF_THRESH, iou=IOU_THRESH, device="cpu")
 
-    # Detector
-    detector = ObjectDetector(MODEL_NAME, IMG_SZ, args.conf, IOU_THRESH, MAX_DETS)
-    names_map = detector.names_map
-    wanted_idxs = {i for i, n in names_map.items() if n.lower() in [c.lower() for c in WANTED_CLASSES]}
+    # Conecta ao servidor de controle (robot)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    log.info("Conectando em %s:%d ...", server_ip, server_port)
+    sock.connect((server_ip, server_port))
+    sock.settimeout(2.0)
 
-    # Camera
-    cam = CameraThread(src=CAM_INDEX, width=CAP_WIDTH, height=CAP_HEIGHT, queue_size=2)
-    time.sleep(0.5)
-
-    # GPIO
-    pwmA, pwmB = gpio_setup()
-    stop_motors(pwmA, pwmB)
-
-    fps_smooth, alpha = 0.0, 0.2
+    # FPS vars
+    prev_time = time.perf_counter()
+    fps = 0.0
+    alpha = 0.9 
 
     try:
         while True:
-            t0 = time.time()
-            frame = cam.read()
+            frame = cam.read(timeout=2.0)
             if frame is None:
+                log.warning("Nenhum frame recebido (timeout).")
+                time.sleep(0.1)
                 continue
 
-            h, w = frame.shape[:2]
-            scale = IMG_SZ / max(h, w)
-            if scale < 1.0:
-                small = cv2.resize(frame, (int(w * scale), int(h * scale)))
-            else:
-                small = frame
-
-            boxes, scores, classes = detector.detect(small, wanted_idxs, scale if scale < 1.0 else None)
-
-            cmd_sent = "STOP"
-            person_idxs = [i for i, c in enumerate(classes) if names_map[c].lower() == "person"]
-            if person_idxs:
-                best = max(person_idxs, key=lambda i: scores[i])
-                x1, _, x2, _ = boxes[best]
-                cx_ratio = (x1 + x2) / (2 * w)
-                if cx_ratio < 0.35:
-                    turn_left(pwmA, pwmB, speed=DEFAULT_SPEED)
-                    cmd_sent = "LEFT"
-                elif cx_ratio > 0.65:
-                    turn_right(pwmA, pwmB, speed=DEFAULT_SPEED)
-                    cmd_sent = "RIGHT"
+            # calcular FPS
+            now = time.perf_counter()
+            dt = now - prev_time
+            prev_time = now
+            if dt > 0:
+                inst_fps = 1.0 / dt
+                if fps == 0.0:
+                    fps = inst_fps
                 else:
-                    forward(pwmA, pwmB, speed=DEFAULT_SPEED)
-                    cmd_sent = "FORWARD"
-            else:
-                stop_motors(pwmA, pwmB)
+                    fps = alpha * fps + (1.0 - alpha) * inst_fps
 
-            frame = draw_boxes(frame, boxes, scores, classes, names_map)
-            cv2.putText(frame, f"CMD: {cmd_sent}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            annotated, classes = detector.infer(frame, imgsz=IMG_SZ)
+            cmd = map_classes_to_command(classes)
+            try:
+                sock.sendall((cmd + "\n").encode("utf-8"))
+            except Exception as e:
+                log.exception("Erro enviando comando: %s", e)
+                break
 
-            t1 = time.time()
-            fps = 1.0 / (t1 - t0) if (t1 - t0) > 0 else 0.0
-            fps_smooth = (1 - alpha) * fps_smooth + alpha * fps
-            cv2.putText(frame, f"FPS: {fps_smooth:.1f}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            # desenhar texto de comando e FPS
+            cv2.putText(annotated, f"CMD: {cmd}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            cv2.putText(annotated, f"FPS: {fps:.1f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-            if show:
-                cv2.imshow("YOLO Robot", frame)
-                if cv2.waitKey(1) & 0xFF == 27:
-                    break
-            else:
-                print(f"FPS: {fps_smooth:.1f} | Dets: {len(boxes)} | CMD: {cmd_sent}", end="\r")
+            cv2.imshow("YOLOv8 - annotated", annotated)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
-    except KeyboardInterrupt:
-        print("Interrompido pelo usuário.")
     finally:
-        cam.release()
-        stop_motors(pwmA, pwmB)
-        pwmA.stop(); pwmB.stop()
-        GPIO.cleanup()
-        if show:
-            cv2.destroyAllWindows()
-        print("\nEncerrado.")
+        log.info("Encerrando cliente.")
+        cam.stop()
+        sock.close()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument("--server", required=True, help="IP do servidor/robot que receberá comandos")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--no-picam", dest="use_picamera", action="store_false", help="Forçar uso OpenCV/V4L2 (legacy)")
+    args = p.parse_args()
+    run_client(args.server, args.port, use_picamera=args.use_picamera)
